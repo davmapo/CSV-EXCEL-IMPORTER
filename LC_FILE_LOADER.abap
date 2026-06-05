@@ -1,9 +1,10 @@
 "! <p class="shorttext">Generic file loader - CSV / XLS / XLSX</p>
-"! Loads a local (frontend) or server (AL11) file into a generic string table.
-"! Each entry in the output table corresponds to one row of the source file.
-"! For CSV the raw line is returned unchanged; the caller splits it using its own separator.
-"! For Excel (XLS/XLSX) each row is reconstructed by joining cell values with IV_SEPARATOR.
-"! Parsing and business logic are left entirely to the caller.
+"! Loads a local (frontend) or server (AL11) file into a table of rows,
+"! where each row is a table of already-separated fields (TT_ROWS / TY_ROW-FIELDS).
+"! CSV is read in BINARY with automatic encoding detection (BOM -> UTF-8 -> fallback
+"! codepage) and parsed quote-aware (RFC 4180 style); IV_SEPARATOR is the CSV field
+"! delimiter. Excel (XLS/XLSX) cells are mapped directly to fields, so the separator
+"! is not used for Excel. Mapping to business structures is left to the caller.
 CLASS lc_file_loader DEFINITION
   PUBLIC
   FINAL
@@ -11,31 +12,49 @@ CLASS lc_file_loader DEFINITION
 
   PUBLIC SECTION.
 
-    TYPES: tt_raw TYPE STANDARD TABLE OF string WITH DEFAULT KEY.
+    TYPES: tt_fields TYPE STANDARD TABLE OF string WITH DEFAULT KEY.
+    TYPES: BEGIN OF ty_row,
+             fields TYPE tt_fields,
+           END OF ty_row.
+    TYPES: tt_rows TYPE STANDARD TABLE OF ty_row WITH DEFAULT KEY.
 
     CONSTANTS:
       gc_source_local  TYPE c LENGTH 1 VALUE 'L',
       gc_source_server TYPE c LENGTH 1 VALUE 'S'.
 
     METHODS:
-      "! Load a file into a generic string table.
+      "! Load a file into a table of rows, each row holding its separated fields.
       "! @parameter iv_path        | Full path (local PC or AL11 server)
       "! @parameter iv_source      | GC_SOURCE_LOCAL ('L') or GC_SOURCE_SERVER ('S')
-      "! @parameter iv_separator   | Cell separator used when converting Excel rows to strings (default ';')
+      "! @parameter iv_separator   | CSV field delimiter (default ';'). Not used for Excel.
       "! @parameter iv_skip_header | If ABAP_TRUE, the first row is removed from the output
-      "! @parameter et_data        | Output: one string per row
+      "! @parameter iv_fallback_cp | Codepage used when the CSV is neither BOM-tagged nor
+      "!                             valid UTF-8 (default '1160' = Windows-1252)
+      "! @parameter et_data        | Output: one row per source line, each with its fields
       "! @parameter ev_error       | Empty on success; error description on failure
       load_file
         IMPORTING
           iv_path        TYPE string
           iv_source      TYPE c
-          iv_separator   TYPE c DEFAULT ';'
-          iv_skip_header TYPE abap_bool DEFAULT abap_false
+          iv_separator   TYPE c             DEFAULT ';'
+          iv_skip_header TYPE abap_bool     DEFAULT abap_false
+          iv_fallback_cp TYPE abap_encoding DEFAULT '1160'
         EXPORTING
-          et_data        TYPE tt_raw
+          et_data        TYPE tt_rows
           ev_error       TYPE string.
 
   PRIVATE SECTION.
+
+    " SAP codepages used for decoding
+    CONSTANTS:
+      lc_cp_utf8    TYPE abap_encoding VALUE '4110',
+      lc_cp_utf16le TYPE abap_encoding VALUE '4103',
+      lc_cp_utf16be TYPE abap_encoding VALUE '4102'.
+    " Byte-Order-Marks
+    CONSTANTS:
+      lc_bom_utf8    TYPE x LENGTH 3 VALUE 'EFBBBF',
+      lc_bom_utf16le TYPE x LENGTH 2 VALUE 'FFFE',
+      lc_bom_utf16be TYPE x LENGTH 2 VALUE 'FEFF'.
 
     METHODS:
       detect_file_type
@@ -43,22 +62,6 @@ CLASS lc_file_loader DEFINITION
           iv_path        TYPE string
         RETURNING
           VALUE(rv_type) TYPE string,
-
-      load_local_csv
-        IMPORTING
-          iv_path        TYPE string
-          iv_skip_header TYPE abap_bool
-        EXPORTING
-          et_data        TYPE tt_raw
-          ev_error       TYPE string,
-
-      load_server_csv
-        IMPORTING
-          iv_path        TYPE string
-          iv_skip_header TYPE abap_bool
-        EXPORTING
-          et_data        TYPE tt_raw
-          ev_error       TYPE string,
 
       read_local_binary
         IMPORTING
@@ -74,13 +77,57 @@ CLASS lc_file_loader DEFINITION
           ev_xstring TYPE xstring
           ev_error   TYPE string,
 
-      excel_xstring_to_strings
+      " CSV: decode (auto-encoding) + normalize line endings + quote-aware field split
+      csv_xstring_to_rows
         IMPORTING
           iv_xstring     TYPE xstring
           iv_separator   TYPE c
           iv_skip_header TYPE abap_bool
+          iv_fallback_cp TYPE abap_encoding
         EXPORTING
-          et_data        TYPE tt_raw
+          et_data        TYPE tt_rows
+          ev_error       TYPE string,
+
+      " Detect the encoding (BOM -> UTF-8 -> fallback) and decode to a string
+      detect_and_decode
+        IMPORTING
+          iv_xdata       TYPE xstring
+          iv_fallback_cp TYPE abap_encoding
+        RETURNING
+          VALUE(rv_text) TYPE string,
+
+      " True if the bytes are valid UTF-8 (strict decode attempt)
+      is_utf8
+        IMPORTING
+          iv_xdata        TYPE xstring
+        RETURNING
+          VALUE(rv_valid) TYPE abap_bool,
+
+      " Decode with a known codepage, skipping IV_SKIP leading bytes (BOM).
+      " Non-mappable bytes become '#' (no exception).
+      to_string
+        IMPORTING
+          iv_xdata       TYPE xstring
+          iv_cp          TYPE abap_encoding
+          iv_skip        TYPE i DEFAULT 0
+        RETURNING
+          VALUE(rv_text) TYPE string,
+
+      " Split one CSV line into fields, RFC 4180 quote-aware
+      parse_csv_line
+        IMPORTING
+          iv_line          TYPE string
+          iv_separator     TYPE c
+        RETURNING
+          VALUE(rt_fields) TYPE tt_fields,
+
+      " Excel: map each worksheet row's cells directly to fields
+      excel_xstring_to_rows
+        IMPORTING
+          iv_xstring     TYPE xstring
+          iv_skip_header TYPE abap_bool
+        EXPORTING
+          et_data        TYPE tt_rows
           ev_error       TYPE string.
 
 ENDCLASS.
@@ -92,27 +139,12 @@ CLASS lc_file_loader IMPLEMENTATION.
     CLEAR: et_data, ev_error.
 
     DATA(lv_type) = detect_file_type( iv_path ).
+    DATA lv_xstring TYPE xstring.
 
     CASE lv_type.
 
       WHEN 'CSV'.
-        IF iv_source = gc_source_local.
-          load_local_csv(
-            EXPORTING iv_path        = iv_path
-                      iv_skip_header = iv_skip_header
-            IMPORTING et_data        = et_data
-                      ev_error       = ev_error ).
-        ELSE.
-          load_server_csv(
-            EXPORTING iv_path        = iv_path
-                      iv_skip_header = iv_skip_header
-            IMPORTING et_data        = et_data
-                      ev_error       = ev_error ).
-        ENDIF.
-
-      WHEN 'XLSX' OR 'XLS'.
-        DATA: lv_xstring TYPE xstring.
-
+        " CSV is now read in binary too, so encoding can be auto-detected
         IF iv_source = gc_source_local.
           read_local_binary(
             EXPORTING iv_path    = iv_path
@@ -126,9 +158,31 @@ CLASS lc_file_loader IMPLEMENTATION.
         ENDIF.
 
         IF ev_error IS INITIAL AND lv_xstring IS NOT INITIAL.
-          excel_xstring_to_strings(
+          csv_xstring_to_rows(
             EXPORTING iv_xstring     = lv_xstring
                       iv_separator   = iv_separator
+                      iv_skip_header = iv_skip_header
+                      iv_fallback_cp = iv_fallback_cp
+            IMPORTING et_data        = et_data
+                      ev_error       = ev_error ).
+        ENDIF.
+
+      WHEN 'XLSX' OR 'XLS'.
+        IF iv_source = gc_source_local.
+          read_local_binary(
+            EXPORTING iv_path    = iv_path
+            IMPORTING ev_xstring = lv_xstring
+                      ev_error   = ev_error ).
+        ELSE.
+          read_server_binary(
+            EXPORTING iv_path    = iv_path
+            IMPORTING ev_xstring = lv_xstring
+                      ev_error   = ev_error ).
+        ENDIF.
+
+        IF ev_error IS INITIAL AND lv_xstring IS NOT INITIAL.
+          excel_xstring_to_rows(
+            EXPORTING iv_xstring     = lv_xstring
                       iv_skip_header = iv_skip_header
             IMPORTING et_data        = et_data
                       ev_error       = ev_error ).
@@ -155,73 +209,6 @@ CLASS lc_file_loader IMPLEMENTATION.
       ENDCASE.
     ELSE.
       rv_type = 'UNKNOWN'.
-    ENDIF.
-  ENDMETHOD.
-
-
-  METHOD load_local_csv.
-    CLEAR: et_data, ev_error.
-
-    cl_gui_frontend_services=>gui_upload(
-      EXPORTING
-        filename                = iv_path
-        filetype                = 'ASC'
-      CHANGING
-        data_tab                = et_data
-      EXCEPTIONS
-        file_open_error         = 1
-        file_read_error         = 2
-        no_batch                = 3
-        gui_refuse_filetransfer = 4
-        invalid_type            = 5
-        no_authority            = 6
-        unknown_error           = 7
-        bad_data_format         = 8
-        header_not_allowed      = 9
-        separator_not_allowed   = 10
-        header_too_long         = 11
-        unknown_dp_error        = 12
-        access_denied           = 13
-        dp_out_of_memory        = 14
-        disk_full               = 15
-        dp_timeout              = 16
-        not_supported_by_gui    = 17
-        error_no_gui            = 18
-        OTHERS                  = 19 ).
-
-    IF sy-subrc <> 0.
-      ev_error = |Error opening local CSV file: { iv_path } (subrc { sy-subrc })|.
-      RETURN.
-    ENDIF.
-
-    IF iv_skip_header = abap_true.
-      DELETE et_data INDEX 1.
-    ENDIF.
-  ENDMETHOD.
-
-
-  METHOD load_server_csv.
-    CLEAR: et_data, ev_error.
-    DATA: lv_line TYPE string.
-
-    OPEN DATASET iv_path FOR INPUT IN TEXT MODE ENCODING DEFAULT WITH SMART LINEFEED.
-    IF sy-subrc <> 0.
-      ev_error = |Error opening server CSV file: { iv_path }|.
-      RETURN.
-    ENDIF.
-
-    DO.
-      READ DATASET iv_path INTO lv_line.
-      IF sy-subrc <> 0.
-        EXIT.
-      ENDIF.
-      APPEND lv_line TO et_data.
-    ENDDO.
-
-    CLOSE DATASET iv_path.
-
-    IF iv_skip_header = abap_true.
-      DELETE et_data INDEX 1.
     ENDIF.
   ENDMETHOD.
 
@@ -291,7 +278,8 @@ CLASS lc_file_loader IMPLEMENTATION.
     CLEAR: ev_xstring, ev_error.
     DATA: lt_raw  TYPE TABLE OF x255,
           ls_raw  TYPE x255,
-          lv_xlen TYPE i.
+          lv_xlen TYPE i,
+          lv_clen TYPE i.
 
     OPEN DATASET iv_path FOR INPUT IN BINARY MODE.
     IF sy-subrc <> 0.
@@ -302,12 +290,14 @@ CLASS lc_file_loader IMPLEMENTATION.
     lv_xlen = 0.
     DO.
       CLEAR ls_raw.
-      READ DATASET iv_path INTO ls_raw.
+      READ DATASET iv_path INTO ls_raw ACTUAL LENGTH lv_clen.
+      IF lv_clen > 0.
+        APPEND ls_raw TO lt_raw.
+        lv_xlen = lv_xlen + lv_clen.
+      ENDIF.
       IF sy-subrc <> 0.
         EXIT.
       ENDIF.
-      APPEND ls_raw TO lt_raw.
-      lv_xlen = lv_xlen + xstrlen( ls_raw ).
     ENDDO.
 
     CLOSE DATASET iv_path.
@@ -334,14 +324,182 @@ CLASS lc_file_loader IMPLEMENTATION.
   ENDMETHOD.
 
 
-  METHOD excel_xstring_to_strings.
+  METHOD csv_xstring_to_rows.
+    CLEAR: et_data, ev_error.
+
+    DATA: lt_lines TYPE STANDARD TABLE OF string,
+          lv_lf    TYPE string,
+          lv_cr    TYPE string.
+
+    " Decode bytes with the detected encoding: the import is indifferent to how the
+    " CSV arrived (ANSI / UTF-8 / UTF-16, with or without BOM).
+    DATA(lv_text) = detect_and_decode( iv_xdata       = iv_xstring
+                                       iv_fallback_cp = iv_fallback_cp ).
+
+    lv_lf = cl_abap_char_utilities=>newline.
+    lv_cr = substring( val = cl_abap_char_utilities=>cr_lf off = 0 len = 1 ).
+
+    " Normalize line endings: CRLF (Windows) -> LF, then a lone CR (classic Mac) -> LF
+    REPLACE ALL OCCURRENCES OF cl_abap_char_utilities=>cr_lf IN lv_text WITH lv_lf.
+    REPLACE ALL OCCURRENCES OF lv_cr IN lv_text WITH lv_lf.
+
+    SPLIT lv_text AT lv_lf INTO TABLE lt_lines.
+
+    IF iv_skip_header = abap_true AND lines( lt_lines ) > 0.
+      DELETE lt_lines INDEX 1.
+    ENDIF.
+
+    LOOP AT lt_lines INTO DATA(lv_line).
+      " skip completely empty lines (trailing newline, blank lines)
+      IF lv_line IS INITIAL.
+        CONTINUE.
+      ENDIF.
+      APPEND VALUE #( fields = parse_csv_line( iv_line      = lv_line
+                                               iv_separator = iv_separator ) ) TO et_data.
+    ENDLOOP.
+  ENDMETHOD.
+
+
+  METHOD detect_and_decode.
+    " First bytes in a fixed-length 'x' field: unlike 'xstring', offset/length are
+    " allowed here, so a BOM can be recognized.
+    DATA lv_head TYPE x LENGTH 4.
+    DATA lv_cp   TYPE abap_encoding.
+    DATA lv_skip TYPE i.
+
+    IF iv_xdata IS INITIAL.
+      RETURN.
+    ENDIF.
+
+    lv_head = iv_xdata.   " first 4 bytes (00-padded if the file is shorter)
+
+    IF lv_head(3) = lc_bom_utf8.
+      lv_cp = lc_cp_utf8.     lv_skip = 3.
+    ELSEIF lv_head(2) = lc_bom_utf16le.
+      lv_cp = lc_cp_utf16le.  lv_skip = 2.
+    ELSEIF lv_head(2) = lc_bom_utf16be.
+      lv_cp = lc_cp_utf16be.  lv_skip = 2.
+    ELSEIF is_utf8( iv_xdata ) = abap_true.
+      lv_cp = lc_cp_utf8.     " UTF-8 without BOM
+    ELSE.
+      lv_cp = iv_fallback_cp. " not UTF-8 -> fallback (default Windows-1252)
+    ENDIF.
+
+    rv_text = to_string( iv_xdata = iv_xdata iv_cp = lv_cp iv_skip = lv_skip ).
+  ENDMETHOD.
+
+
+  METHOD is_utf8.
+    " STRICT UTF-8 decode (ignore_cerr = abap_false): READ raises
+    " cx_sy_conversion_codepage on the first invalid byte -> not UTF-8.
+    DATA lv_dummy TYPE string.
+    TRY.
+        cl_abap_conv_in_ce=>create(
+          encoding    = lc_cp_utf8
+          ignore_cerr = abap_false
+          input       = iv_xdata
+        )->read( IMPORTING data = lv_dummy ).
+        rv_valid = abap_true.
+      CATCH cx_sy_conversion_codepage
+            cx_sy_codepage_converter_init
+            cx_parameter_invalid_range
+            cx_parameter_invalid_type.
+        rv_valid = abap_false.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD to_string.
+    " "Committed" decode: ignore_cerr = abap_true -> non-mappable bytes -> '#'.
+    " skip_x skips the iv_skip BOM bytes before reading the content.
+    DATA lo_conv TYPE REF TO cl_abap_conv_in_ce.
+    TRY.
+        lo_conv = cl_abap_conv_in_ce=>create(
+          encoding    = iv_cp
+          ignore_cerr = abap_true
+          input       = iv_xdata ).
+        IF iv_skip > 0.
+          lo_conv->skip_x( iv_skip ).
+        ENDIF.
+        lo_conv->read( IMPORTING data = rv_text ).
+      CATCH cx_sy_conversion_codepage
+            cx_sy_codepage_converter_init
+            cx_parameter_invalid_range
+            cx_parameter_invalid_type.
+        CLEAR rv_text.
+    ENDTRY.
+  ENDMETHOD.
+
+
+  METHOD parse_csv_line.
+    " RFC 4180-style CSV parser (quote-aware), one line at a time:
+    "  - the separator only counts OUTSIDE quotes
+    "  - "" inside a quoted field = one literal "
+    "  - the delimiting quotes are not kept in the value
+    " Note: a newline inside a quoted field is NOT handled (rare in business CSVs):
+    "       the line already arrives split by the caller.
+    DATA: lv_len       TYPE i,
+          lv_i         TYPE i,
+          lv_j         TYPE i,
+          lv_char      TYPE c LENGTH 1,
+          lv_next      TYPE c LENGTH 1,
+          lv_field     TYPE string,
+          lv_in_quotes TYPE abap_bool VALUE abap_false.
+
+    lv_len = strlen( iv_line ).
+    IF lv_len = 0.
+      RETURN.
+    ENDIF.
+
+    lv_i = 0.
+    WHILE lv_i < lv_len.
+      lv_char = iv_line+lv_i(1).
+
+      " one-char look-ahead, only within bounds (avoids out-of-range access)
+      CLEAR lv_next.
+      lv_j = lv_i + 1.
+      IF lv_j < lv_len.
+        lv_next = iv_line+lv_j(1).
+      ENDIF.
+
+      IF lv_in_quotes = abap_true.
+        IF lv_char = '"'.
+          IF lv_next = '"'.             " doubled quote ("") -> one literal "
+            lv_field = lv_field && '"'.
+            lv_i = lv_i + 1.            " skip the second quote
+          ELSE.
+            lv_in_quotes = abap_false.  " closing quote
+          ENDIF.
+        ELSE.
+          lv_field = lv_field && lv_char.
+        ENDIF.
+      ELSE.
+        IF lv_char = '"'.
+          lv_in_quotes = abap_true.     " opening quote
+        ELSEIF lv_char = iv_separator.
+          APPEND lv_field TO rt_fields.
+          CLEAR lv_field.
+        ELSE.
+          lv_field = lv_field && lv_char.
+        ENDIF.
+      ENDIF.
+
+      lv_i = lv_i + 1.
+    ENDWHILE.
+
+    " last field
+    APPEND lv_field TO rt_fields.
+  ENDMETHOD.
+
+
+  METHOD excel_xstring_to_rows.
     CLEAR: et_data, ev_error.
 
     DATA: lo_excel  TYPE REF TO cl_fdt_xl_spreadsheet,
           lt_sheets TYPE STANDARD TABLE OF string,
           lv_sheet  TYPE string,
           lo_data   TYPE REF TO data,
-          lv_row    TYPE string,
+          ls_row    TYPE ty_row,
           lv_cell   TYPE string,
           lv_idx    TYPE i.
 
@@ -380,7 +538,7 @@ CLASS lc_file_loader IMPLEMENTATION.
     CHECK <lt_tab> IS ASSIGNED.
 
     LOOP AT <lt_tab> ASSIGNING <ls_row>.
-      CLEAR: lv_row, lv_idx.
+      CLEAR ls_row.
       lv_idx = 1.
 
       DO.
@@ -390,17 +548,12 @@ CLASS lc_file_loader IMPLEMENTATION.
         ENDIF.
 
         lv_cell = <lv_cell>.
-
-        IF lv_idx = 1.
-          lv_row = lv_cell.
-        ELSE.
-          lv_row = lv_row && iv_separator && lv_cell.
-        ENDIF.
+        APPEND lv_cell TO ls_row-fields.
 
         lv_idx = lv_idx + 1.
       ENDDO.
 
-      APPEND lv_row TO et_data.
+      APPEND ls_row TO et_data.
     ENDLOOP.
 
     IF iv_skip_header = abap_true.
